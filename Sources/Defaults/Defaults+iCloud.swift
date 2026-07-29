@@ -215,8 +215,6 @@ final class iCloudSynchronizer {
 		removeAll()
 	}
 
-	@TaskLocal static var timestamp: Date?
-
 	private var cancellables = Set<AnyCancellable>()
 
 	/**
@@ -244,6 +242,8 @@ final class iCloudSynchronizer {
 	*/
 	@_DefaultsAtomic(value: []) private var remoteSyncingKeys: Set<Defaults.Keys>
 
+	@_DefaultsAtomic(value: []) private var localSyncingKeys: Set<Defaults.Keys>
+
 	// TODO: Replace it with async stream when Swift supports custom executors.
 	private lazy var localKeysMonitor: Defaults.CompositeDefaultsObservation = .init { [weak self] pair, _ in
 		guard
@@ -256,9 +256,9 @@ final class iCloudSynchronizer {
 			return
 		}
 
-		enqueue {
-			self.recordTimestamp(forKey: key, timestamp: Self.timestamp, source: .local)
-			await self.syncKey(key, source: .local)
+		enqueue { timestamp in
+			self.recordTimestamp(forKey: key, timestamp: timestamp, source: .local)
+			await self.syncKey(key, source: .local, timestamp: timestamp)
 		}
 	}
 
@@ -339,8 +339,8 @@ final class iCloudSynchronizer {
 				Self.logKeySyncStatus(key, source: nil, syncStatus: .aborted, value: nil)
 				continue
 			}
-			enqueue {
-				await self.syncKey(key, source: latest)
+			enqueue { timestamp in
+				await self.syncKey(key, source: latest, timestamp: timestamp)
 			}
 		}
 	}
@@ -355,11 +355,9 @@ final class iCloudSynchronizer {
 	/**
 	Enqueue the synchronization task into `backgroundQueue` with the current timestamp.
 	*/
-	private func enqueue(_ task: @escaping TaskQueue.AsyncTask) {
+	private func enqueue(_ task: @escaping @Sendable (Date) async -> Void) {
 		backgroundQueue.async {
-			await Self.$timestamp.withValue(Date()) {
-				await task()
-			}
+			await task(Date())
 		}
 	}
 
@@ -369,14 +367,14 @@ final class iCloudSynchronizer {
 	- Parameter key: The key to synchronize.
 	- Parameter source: Sync key from which data source (remote or local).
 	*/
-	private func syncKey(_ key: Defaults.Keys, source: Defaults.iCloud.DataSource) async {
+	private func syncKey(_ key: Defaults.Keys, source: Defaults.iCloud.DataSource, timestamp: Date) async {
 		Self.logKeySyncStatus(key, source: source, syncStatus: .idle)
 
 		switch source {
 		case .remote:
-			await syncFromRemote(forKey: key)
+			await syncFromRemote(forKey: key, timestamp: timestamp)
 		case .local:
-			syncFromLocal(forKey: key)
+			syncFromLocal(forKey: key, timestamp: timestamp)
 		}
 
 		Self.logKeySyncStatus(key, source: source, syncStatus: .completed)
@@ -385,37 +383,33 @@ final class iCloudSynchronizer {
 	/**
 	Only update the value if it can be retrieved from the remote storage.
 	*/
-	private func syncFromRemote(forKey key: Defaults.Keys) async {
+	private func syncFromRemote(forKey key: Defaults.Keys, timestamp: Date) async {
 		_remoteSyncingKeys.modify { $0.insert(key) }
+		defer { _remoteSyncingKeys.modify { $0.remove(key) } }
 
-		await withCheckedContinuation { continuation in
-			guard
-				let object = remoteStorage.object(forKey: key.name) as? [Any],
-				let date = Self.timestamp,
-				let value = object[safe: 1]
-			else {
-				continuation.resume()
-				return
-			}
-
-			Task { @MainActor in
-				Self.logKeySyncStatus(key, source: .remote, syncStatus: .syncing, value: value)
-				key.suite.set(value, forKey: key.name)
-				key.suite.set(date, forKey: "\(key.name)\(defaultsSyncKey)")
-				continuation.resume()
-			}
+		guard
+			let object = remoteStorage.object(forKey: key.name) as? [Any],
+			let value = object[safe: 1]
+		else {
+			return
 		}
 
-		_remoteSyncingKeys.modify { $0.remove(key) }
+		await MainActor.run {
+			Self.logKeySyncStatus(key, source: .remote, syncStatus: .syncing, value: value)
+			key.suite.set(value, forKey: key.name)
+			key.suite.set(timestamp, forKey: "\(key.name)\(defaultsSyncKey)")
+		}
 	}
 
 	/**
 	Retrieve a value from local storage, and if it does not exist, remove it from the remote storage.
 	*/
-	private func syncFromLocal(forKey key: Defaults.Keys) {
+	private func syncFromLocal(forKey key: Defaults.Keys, timestamp: Date) {
+		_localSyncingKeys.modify { $0.insert(key) }
+		defer { _localSyncingKeys.modify { $0.remove(key) } }
+
 		guard
-			let value = key.suite.object(forKey: key.name),
-			let date = Self.timestamp
+			let value = key.suite.object(forKey: key.name)
 		else {
 			Self.logKeySyncStatus(key, source: .local, syncStatus: .syncing, value: nil)
 			remoteStorage.removeObject(forKey: key.name)
@@ -424,7 +418,7 @@ final class iCloudSynchronizer {
 		}
 
 		Self.logKeySyncStatus(key, source: .local, syncStatus: .syncing, value: value)
-		remoteStorage.set([date, value], forKey: key.name)
+		remoteStorage.set([timestamp, value], forKey: key.name)
 		syncRemoteStorageOnChange()
 	}
 
@@ -556,14 +550,12 @@ extension iCloudSynchronizer {
 
 		guard
 			let userInfo = notification.userInfo,
-			let changedKeys = userInfo[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String],
-			// If `@TaskLocal timestamp` is not nil, it indicates that this notification is triggered by `syncRemoteStorageOnChange`, and therefore, we can skip updating the local storage.
-			Self.timestamp._defaults_isNil
+			let changedKeys = userInfo[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
 		else {
 			return
 		}
 
-		for key in keys where changedKeys.contains(key.name) {
+		for key in keys where changedKeys.contains(key.name) && !localSyncingKeys.contains(key) {
 			guard let remoteTimestamp = self.timestamp(forKey: key, source: .remote) else {
 				continue
 			}
@@ -575,8 +567,8 @@ extension iCloudSynchronizer {
 				continue
 			}
 
-			self.enqueue {
-				await self.syncKey(key, source: .remote)
+			self.enqueue { timestamp in
+				await self.syncKey(key, source: .remote, timestamp: timestamp)
 			}
 		}
 	}
